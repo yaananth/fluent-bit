@@ -21,6 +21,7 @@
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_output_plugin.h>
+#include <fluent-bit/flb_event.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_scheduler.h>
@@ -960,6 +961,26 @@ static int cb_azure_kusto_init(struct flb_output_instance *ins, struct flb_confi
 }
 
 
+struct azure_kusto_concat_ctx {
+    flb_sds_t buffer;
+};
+
+static int azure_kusto_emit_concat_cb(struct flb_azure_kusto *ctx,
+                                      flb_sds_t record, void *data)
+{
+    struct azure_kusto_concat_ctx *cb = data;
+
+    cb->buffer = flb_sds_cat(cb->buffer, record, flb_sds_len(record));
+    if (!cb->buffer) {
+        flb_plg_error(ctx->ins, "error expanding output buffer");
+        flb_sds_destroy(record);
+        return -1;
+    }
+
+    flb_sds_destroy(record);
+    return 0;
+}
+
 /**
      * This function formats log data for Azure Kusto ingestion.
      * It processes a batch of log records, encodes them in a specific format,
@@ -982,6 +1003,99 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
                               size_t *out_size,
                               struct flb_config *config)
 {
+    int ret;
+    struct azure_kusto_concat_ctx cb;
+    struct flb_event_chunk tmp_chunk = {0};
+    flb_sds_t tmp_tag;
+
+    cb.buffer = flb_sds_create_size(1024);
+    if (!cb.buffer) {
+        flb_plg_error(ctx->ins, "error creating output buffer");
+        return -1;
+    }
+
+    tmp_tag = flb_sds_create_len(tag, tag_len);
+    if (!tmp_tag) {
+        flb_plg_error(ctx->ins, "error creating tag buffer");
+        flb_sds_destroy(cb.buffer);
+        return -1;
+    }
+
+    tmp_chunk.tag = tmp_tag;
+    tmp_chunk.data = (void *) data;
+    tmp_chunk.size = bytes;
+
+    ret = flb_azure_kusto_format_emit(ctx, &tmp_chunk, config,
+                                      azure_kusto_emit_concat_cb, &cb);
+
+    flb_sds_destroy(tmp_tag);
+
+    if (ret != 0) {
+        flb_sds_destroy(cb.buffer);
+        return -1;
+    }
+
+    *out_data = cb.buffer;
+    *out_size = flb_sds_len(cb.buffer);
+
+    return 0;
+}
+
+
+/*
+ * Helpers that allow us to walk MsgPack chunks once and hand each rendered
+ * record to the caller.  The buffered path uses these to count bytes and stream
+ * directly into the filesystem storage instead of concatenating everything in
+ * heap memory.
+ */
+static int buffer_chunk(void *out_context, struct azure_kusto_file *upload_file,
+                        flb_sds_t chunk, int chunk_size,
+                        flb_sds_t tag, size_t tag_len);
+
+struct azure_kusto_buffer_ctx {
+    struct azure_kusto_file *upload_file;
+    flb_sds_t tag;
+    size_t tag_len;
+};
+
+static int azure_kusto_emit_buffer_cb(struct flb_azure_kusto *ctx,
+                                      flb_sds_t record, void *data)
+{
+    struct azure_kusto_buffer_ctx *cb = data;
+    int ret;
+
+    ret = buffer_chunk(ctx, cb->upload_file, record,
+                       flb_sds_len(record), cb->tag, cb->tag_len);
+    flb_sds_destroy(record);
+
+    if (ret == 0 && cb->upload_file == NULL) {
+        cb->upload_file = azure_kusto_store_file_get(ctx,
+                                                     cb->tag,
+                                                     cb->tag_len);
+    }
+    return ret;
+}
+
+struct azure_kusto_count_ctx {
+    size_t total_bytes;
+};
+
+static int azure_kusto_count_cb(struct flb_azure_kusto *ctx,
+                                flb_sds_t record, void *data)
+{
+    struct azure_kusto_count_ctx *cb = data;
+
+    cb->total_bytes += flb_sds_len(record);
+    flb_sds_destroy(record);
+    return 0;
+}
+
+int flb_azure_kusto_format_emit(struct flb_azure_kusto *ctx,
+                                struct flb_event_chunk *event_chunk,
+                                struct flb_config *config,
+                                flb_azure_kusto_emit_fn emit_cb,
+                                void *cb_data)
+{
     int index;
     int records = 0;
     msgpack_sbuffer mp_sbuf;
@@ -993,37 +1107,38 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
     struct flb_log_event_decoder log_decoder;
     struct flb_log_event log_event;
     int ret;
-    flb_sds_t out_buf;
+    int escape_unicode = FLB_FALSE;
 
-    /* Create array for all records */
-    records = flb_mp_count(data, bytes);
+    if (!emit_cb) {
+        return -1;
+    }
+
+    if (config) {
+        escape_unicode = config->json_escape_unicode;
+    }
+
+    records = flb_mp_count(event_chunk->data, event_chunk->size);
     if (records <= 0) {
         flb_plg_error(ctx->ins, "error counting msgpack entries");
         return -1;
     }
 
-    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+    ret = flb_log_event_decoder_init(&log_decoder,
+                                     (char *) event_chunk->data,
+                                     event_chunk->size);
     if (ret != FLB_EVENT_DECODER_SUCCESS) {
         flb_plg_error(ctx->ins, "Log event decoder initialization error : %d", ret);
         return -1;
     }
 
-    /* Initialize the output buffer */
-    out_buf = flb_sds_create_size(1024);
-    if (!out_buf) {
-        flb_plg_error(ctx->ins, "error creating output buffer");
-        flb_log_event_decoder_destroy(&log_decoder);
-        return -1;
-    }
-
-    /* Create temporary msgpack buffer */
     msgpack_sbuffer_init(&mp_sbuf);
     msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
     while ((ret = flb_log_event_decoder_next(&log_decoder, &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        int map_size = 1;
+
         msgpack_sbuffer_clear(&mp_sbuf);
 
-        int map_size = 1;
         if (ctx->include_time_key == FLB_TRUE) {
             map_size++;
         }
@@ -1033,26 +1148,25 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
 
         msgpack_pack_map(&mp_pck, map_size);
 
-        /* include_time_key */
         if (ctx->include_time_key == FLB_TRUE) {
             msgpack_pack_str(&mp_pck, flb_sds_len(ctx->time_key));
             msgpack_pack_str_body(&mp_pck, ctx->time_key, flb_sds_len(ctx->time_key));
 
             gmtime_r(&log_event.timestamp.tm.tv_sec, &tms);
             s = strftime(time_formatted, sizeof(time_formatted) - 1, FLB_PACK_JSON_DATE_ISO8601_FMT, &tms);
-            len = snprintf(time_formatted + s, sizeof(time_formatted) - 1 - s, ".%03" PRIu64 "Z",
-                    (uint64_t) log_event.timestamp.tm.tv_nsec / 1000000);
+            len = snprintf(time_formatted + s, sizeof(time_formatted) - 1 - s,
+                           ".%03" PRIu64 "Z",
+                           (uint64_t) log_event.timestamp.tm.tv_nsec / 1000000);
             s += len;
             msgpack_pack_str(&mp_pck, s);
             msgpack_pack_str_body(&mp_pck, time_formatted, s);
         }
 
-        /* include_tag_key */
         if (ctx->include_tag_key == FLB_TRUE) {
             msgpack_pack_str(&mp_pck, flb_sds_len(ctx->tag_key));
             msgpack_pack_str_body(&mp_pck, ctx->tag_key, flb_sds_len(ctx->tag_key));
-            msgpack_pack_str(&mp_pck, tag_len);
-            msgpack_pack_str_body(&mp_pck, tag, tag_len);
+            msgpack_pack_str(&mp_pck, flb_sds_len(event_chunk->tag));
+            msgpack_pack_str_body(&mp_pck, event_chunk->tag, flb_sds_len(event_chunk->tag));
         }
 
         msgpack_pack_str(&mp_pck, flb_sds_len(ctx->log_key));
@@ -1060,11 +1174,11 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
 
         if (log_event.group_attributes != NULL && log_event.body != NULL) {
             msgpack_pack_map(&mp_pck,
-                                 log_event.group_attributes->via.map.size +
-                                 log_event.metadata->via.map.size +
-                                 log_event.body->via.map.size);
+                             log_event.group_attributes->via.map.size +
+                             log_event.metadata->via.map.size +
+                             log_event.body->via.map.size);
 
-            for (index = 0; index < log_event.group_attributes->via.map.size; index++) { 
+            for (index = 0; index < log_event.group_attributes->via.map.size; index++) {
                 msgpack_pack_object(&mp_pck, log_event.group_attributes->via.map.ptr[index].key);
                 msgpack_pack_object(&mp_pck, log_event.group_attributes->via.map.ptr[index].val);
             }
@@ -1087,28 +1201,33 @@ static int azure_kusto_format(struct flb_azure_kusto *ctx, const char *tag, int 
             msgpack_pack_str_body(&mp_pck, "log_attribute_missing", 20);
         }
 
-        flb_sds_t json_record = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size,
-                                                            config->json_escape_unicode);
+        flb_sds_t json_record = flb_msgpack_raw_to_json_sds(mp_sbuf.data,
+                                                            mp_sbuf.size,
+                                                            escape_unicode);
         if (!json_record) {
             flb_plg_error(ctx->ins, "error converting msgpack to JSON");
-            flb_sds_destroy(out_buf);
             msgpack_sbuffer_destroy(&mp_sbuf);
             flb_log_event_decoder_destroy(&log_decoder);
             return -1;
         }
 
-        /* Concatenate the JSON record to the output buffer */
-        out_buf = flb_sds_cat(out_buf, json_record, flb_sds_len(json_record));
-        out_buf = flb_sds_cat(out_buf, "\n", 1);
+        json_record = flb_sds_cat(json_record, "\n", 1);
+        if (!json_record) {
+            msgpack_sbuffer_destroy(&mp_sbuf);
+            flb_log_event_decoder_destroy(&log_decoder);
+            return -1;
+        }
 
-        flb_sds_destroy(json_record);
+        if (emit_cb(ctx, json_record, cb_data) != 0) {
+            flb_sds_destroy(json_record);
+            msgpack_sbuffer_destroy(&mp_sbuf);
+            flb_log_event_decoder_destroy(&log_decoder);
+            return -1;
+        }
     }
 
     msgpack_sbuffer_destroy(&mp_sbuf);
     flb_log_event_decoder_destroy(&log_decoder);
-
-    *out_data = out_buf;
-    *out_size = flb_sds_len(out_buf);
 
     return 0;
 }
@@ -1256,15 +1375,18 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
         /* Initialize the flush process */
         flush_init(ctx,config);
 
-        /* Reformat msgpack to JSON payload */
-        ret = azure_kusto_format(ctx, tag_name, tag_name_len, event_chunk->data,
-                                 event_chunk->size, (void **)&json, &json_size,
-                                 config);
+        /* Count the JSON payload size without materializing it */
+        struct azure_kusto_count_ctx count_ctx = {0};
+
+        ret = flb_azure_kusto_format_emit(ctx, event_chunk, config,
+                                          azure_kusto_count_cb, &count_ctx);
         if (ret != 0) {
             flb_plg_error(ctx->ins, "cannot reformat data into json");
             ret = FLB_RETRY;
             goto error;
         }
+
+        json_size = count_ctx.total_bytes;
 
         /* Get a file candidate matching the given 'tag' */
         upload_file = azure_kusto_store_file_get(ctx,
@@ -1301,6 +1423,18 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
 
         /* If the file is ready for upload */
         if ((upload_file != NULL) && (upload_timeout_check == FLB_TRUE || total_file_size_check == FLB_TRUE)) {
+            flb_sds_destroy(json);
+            json = NULL;
+
+            ret = azure_kusto_format(ctx, tag_name, tag_name_len, event_chunk->data,
+                                     event_chunk->size, (void **)&json, &json_size,
+                                     config);
+            if (ret != 0) {
+                flb_plg_error(ctx->ins, "cannot reformat data into json");
+                ret = FLB_RETRY;
+                goto error;
+            }
+
             flb_plg_debug(ctx->ins, "uploading file %s with size %zu", upload_file->fsf->name, upload_file->size);
             /* Load or refresh ingestion resources */
             ret = azure_kusto_load_ingestion_resources(ctx, config);
@@ -1350,9 +1484,19 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
             }
         }
 
-        /* Buffer the current chunk in the filesystem */
-        ret = buffer_chunk(ctx, upload_file, json, json_size,
-                           tag_name, tag_name_len);
+        upload_file = azure_kusto_store_file_get(ctx,
+                                                 tag_name,
+                                                 tag_name_len);
+
+        struct azure_kusto_buffer_ctx buffer_ctx = {
+            .upload_file = upload_file,
+            .tag = tag_name,
+            .tag_len = tag_name_len
+        };
+
+        /* Buffer the current chunk in the filesystem without building a contiguous payload */
+        ret = flb_azure_kusto_format_emit(ctx, event_chunk, config,
+                                          azure_kusto_emit_buffer_cb, &buffer_ctx);
 
         if (ret == 0) {
             flb_plg_debug(ctx->ins, "buffered chunk %s", event_chunk->tag);

@@ -55,6 +55,7 @@ set(UNIT_TESTS_FILES
   strptime.c
   storage_inherit.c
   unicode.c
+  azure_kusto.c
   opentelemetry.c
   storage_dlq.c
 )

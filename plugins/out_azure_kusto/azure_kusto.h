@@ -21,6 +21,8 @@
 #define FLB_OUT_AZURE_KUSTO
 
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_event.h>
 #include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_sds.h>
@@ -175,6 +177,20 @@ struct flb_azure_kusto {
     /* Plugin output instance reference */
     struct flb_output_instance *ins;
 };
+
+/* Generic callback signature used by the formatter so callers can decide
+ * whether to concatenate, buffer, or just count each rendered record. */
+typedef int (*flb_azure_kusto_emit_fn)(struct flb_azure_kusto *ctx,
+                                       flb_sds_t record,
+                                       void *cb_data);
+
+/* Streaming formatter entry point shared by the buffered and non-buffered
+ * ingestion paths. */
+int flb_azure_kusto_format_emit(struct flb_azure_kusto *ctx,
+                                struct flb_event_chunk *event_chunk,
+                                struct flb_config *config,
+                                flb_azure_kusto_emit_fn emit_cb,
+                                void *cb_data);
 
 flb_sds_t get_azure_kusto_token(struct flb_azure_kusto *ctx);
 flb_sds_t execute_ingest_csl_command(struct flb_azure_kusto *ctx, const char *csl);
