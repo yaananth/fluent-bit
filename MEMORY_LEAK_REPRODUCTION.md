@@ -75,6 +75,7 @@ EOF
 ### 3. Prepare Test Payloads
 
 **Small payload (153 bytes):**
+
 ```bash
 cat > /workspaces/fluent-bit/small_payload.json <<'EOF'
 {"timestamp":"2024-11-05T19:58:35Z","event":"test","message":"Small test payload for memory leak validation","level":"info","service":"fluent-bit-test"}
@@ -209,17 +210,20 @@ chmod +x /workspaces/fluent-bit/stress_test.sh
 ### 5. Run Tests
 
 **Start Fluent Bit:**
+
 ```bash
 cd /workspaces/fluent-bit/build
 ./bin/fluent-bit -c /tmp/fluent-bit-leak-test.conf >/dev/null 2>&1 &
 ```
 
 **Test with large payload (demonstrates leak):**
+
 ```bash
 bash /workspaces/fluent-bit/stress_test.sh 50000 3
 ```
 
 **Expected output:**
+
 ```
 === Stress Test Results ===
 Total requests:   50000
@@ -235,6 +239,7 @@ Avg per request:  0.783 KB
 ```
 
 **Test with small payload (minimal leak):**
+
 ```bash
 # Modify PAYLOAD_FILE in script or create stress_test_small.sh
 sed 's|sample_trigger.json|small_payload.json|' stress_test.sh > stress_test_small.sh
@@ -243,6 +248,7 @@ bash /workspaces/fluent-bit/stress_test_small.sh 50000 3
 ```
 
 **Expected output:**
+
 ```
 === Stress Test Results ===
 Total requests:   50000
@@ -260,6 +266,7 @@ Avg per request:  0.30 KB
 ### 6. Verify Memory Does Not Drop
 
 After test completion, monitor idle memory:
+
 ```bash
 PID=$(pgrep fluent-bit | head -1)
 for i in {1..10}; do 
@@ -294,11 +301,13 @@ The leak is definitively in the **HTTP input plugin** (`plugins/in_http/`). Evid
 5. **Log encoder buffers** → Internal msgpack buffers accumulate, not fully released
 
 **Why small payloads don't leak:**
+
 - 153 bytes fits in initial 1 MB buffer
 - No expansion needed
 - Minimal parser overhead
 
 **Why large payloads leak:**
+
 - 187 KB triggers expansion to ~200 KB+
 - Stays below 2 MB shrink threshold
 - Buffer never releases back to 1 MB
@@ -307,6 +316,7 @@ The leak is definitively in the **HTTP input plugin** (`plugins/in_http/`). Evid
 ## Fixes Applied (Commit 108a5b9d1)
 
 ### 1. Buffer Shrinking (`plugins/in_http/http_conn.c`)
+
 ```c
 /* Shrink oversized buffers to prevent memory accumulation from large payloads */
 if (conn->buf_size > ctx->buffer_chunk_size * 2) {
@@ -319,6 +329,7 @@ if (conn->buf_size > ctx->buffer_chunk_size * 2) {
 ```
 
 ### 2. Log Encoder Reset (`plugins/in_http/http_prot.c`)
+
 ```c
 /* Fully release log encoder buffers to prevent accumulation */
 flb_log_event_encoder_destroy(&ctx->log_encoder);
@@ -326,6 +337,7 @@ flb_log_event_encoder_init(&ctx->log_encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
 ```
 
 ### 3. Buffer Null Safety (`plugins/out_azure_kusto/azure_kusto.c`)
+
 ```c
 if (encoder->output_buffer != NULL) {
     flb_free(encoder->output_buffer);
@@ -365,11 +377,13 @@ if (encoder->output_buffer != NULL) {
 ## Files of Interest
 
 **Core leak sources:**
+
 - `plugins/in_http/http_conn.c` - Connection buffer management
 - `plugins/in_http/http_prot.c` - JSON parsing and log encoding
 - `plugins/in_http/http.h` - Structure definitions
 
 **Supporting code:**
+
 - `src/flb_log_event_encoder.c` - Log event encoding buffers
 - `lib/msgpack-c/` - Msgpack serialization (potential buffer accumulation)
 - `lib/yyjson/` - JSON parser (heap allocations during parsing)
@@ -381,6 +395,7 @@ if (encoder->output_buffer != NULL) {
 ## Contact
 
 For questions or updates on this issue, see original analysis in:
+
 - `HOTPATH_FIXES.md` - Initial leak identification
 - `CODESPACE_RESUME.md` - Investigation context
 
@@ -389,4 +404,3 @@ For questions or updates on this issue, see original analysis in:
 **Last Updated:** 2024-11-18  
 **Branch:** rentziass/leask (commit 108a5b9d1)  
 **Reproduced By:** GitHub Copilot + human operator
-
