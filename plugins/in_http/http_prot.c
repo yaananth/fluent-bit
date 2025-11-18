@@ -375,21 +375,25 @@ static ssize_t parse_payload_json(struct flb_http *ctx, flb_sds_t tag,
     /* Pack JSON as msgpack */
     ret = flb_pack_json_state(payload, size,
                               &pack, &out_size, &pack_state);
-    flb_pack_state_reset(&pack_state);
 
     /* Handle exceptions */
     if (ret == FLB_ERR_JSON_PART) {
         flb_plg_warn(ctx->ins, "JSON data is incomplete, skipping");
+        flb_pack_state_reset(&pack_state);
         return -1;
     }
     else if (ret == FLB_ERR_JSON_INVAL) {
         flb_plg_warn(ctx->ins, "invalid JSON message, skipping");
+        flb_pack_state_reset(&pack_state);
         return -1;
     }
     else if (ret == -1) {
         flb_plg_warn(ctx->ins, "error parsing JSON message, skipping");
+        flb_pack_state_reset(&pack_state);
         return -1;
     }
+
+    flb_pack_state_reset(&pack_state);
 
     /* Process the packaged JSON and return the last byte used */
     ret = process_pack(ctx, tag, pack, out_size);
@@ -428,12 +432,15 @@ static ssize_t parse_payload_urlencoded(struct flb_http *ctx, flb_sds_t tag,
 
     keys = flb_calloc(mk_list_size(kvs), sizeof(char *));
     if (keys == NULL) {
-        goto keys_calloc_error;
+        flb_utils_split_free(kvs);
+        goto split_error;
     }
 
     vals = flb_calloc(mk_list_size(kvs), sizeof(char *));
     if (vals == NULL) {
-        goto vals_calloc_error;
+        flb_free(keys);
+        flb_utils_split_free(kvs);
+        goto split_error;
     }
 
     mk_list_foreach_safe(head, tmp, kvs) {
@@ -506,9 +513,7 @@ decode_error:
         }
     }
     flb_free(vals);
-vals_calloc_error:
     flb_free(keys);
-keys_calloc_error:
     flb_utils_split_free(kvs);
 split_error:
     msgpack_sbuffer_destroy(&sbuf);
@@ -1161,13 +1166,16 @@ static ssize_t parse_payload_json_ng(flb_sds_t tag,
     /* Handle exceptions */
     if (ret == FLB_ERR_JSON_PART) {
         flb_plg_warn(ctx->ins, "JSON data is incomplete, skipping");
+        flb_pack_state_reset(&pack_state);
         return -1;
     }
     else if (ret == FLB_ERR_JSON_INVAL) {
         flb_plg_warn(ctx->ins, "invalid JSON message, skipping");
+        flb_pack_state_reset(&pack_state);
         return -1;
     }
     else if (ret == -1) {
+        flb_pack_state_reset(&pack_state);
         return -1;
     }
 

@@ -36,6 +36,8 @@ static int http_conn_buffer_realloc(struct flb_http *ctx, struct http_conn *conn
     if (!tmp) {
         flb_errno();
         flb_plg_error(ctx->ins, "could not perform realloc for size %zu", size);
+        /* Note: original conn->buf_data is still valid on realloc failure */
+        /* Caller should handle connection cleanup */
         return -1;
     }
 

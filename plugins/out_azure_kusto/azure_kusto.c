@@ -331,6 +331,9 @@ static int construct_request_buffer(struct flb_azure_kusto *ctx, flb_sds_t new_d
         if (ret < 0) {
             flb_plg_error(ctx->ins, "Could not read locally buffered data %s",
                           upload_file->fsf->name);
+            if (buffered_data) {
+                flb_free(buffered_data);
+            }
             return -1;
         }
 
@@ -471,8 +474,12 @@ static int ingest_all_chunks(struct flb_azure_kusto *ctx, struct flb_config *con
                 if (ret != 0) {
                     flb_plg_error(ctx->ins,
                                   "ingest_all_old_buffer_files :: cannot gzip payload");
+                    if (chunk) {
+                        azure_kusto_store_file_unlock(chunk);
+                    }
                     flb_sds_destroy(payload);
                     flb_sds_destroy(tag_sds);
+                    flb_free(buffer);
                     return -1;
                 }
                 else {
@@ -603,6 +610,10 @@ static void cb_azure_kusto_ingest(struct flb_config *config, void *data)
             ret = construct_request_buffer(ctx, NULL, file, &buffer, &buffer_size);
             if (ret < 0) {
                 flb_plg_error(ctx->ins, "scheduler_kusto_ingest :: Could not construct request buffer for %s", file->fsf->name);
+                if (buffer) {
+                    flb_free(buffer);
+                    buffer = NULL;
+                }
                 retry_count++;
                 /* Add jitter: random value between 0 and backoff_time */
                 int jitter = rand() % backoff_time;
@@ -613,6 +624,8 @@ static void cb_azure_kusto_ingest(struct flb_config *config, void *data)
 
             payload = flb_sds_create_len(buffer, buffer_size);
             tag_sds = flb_sds_create(fsf->meta_buf);
+            flb_free(buffer);
+            buffer = NULL;
 
             /* Compress the JSON payload if compression is enabled */
             if (ctx->compression_enabled == FLB_TRUE) {
@@ -1404,6 +1417,10 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
                 azure_kusto_store_file_inactive(ctx, upload_file);
             }
             upload_file = NULL;
+            if (json) {
+                flb_sds_destroy(json);
+                json = NULL;
+            }
         }
 
         /* Check if the upload timeout has elapsed */
@@ -1423,14 +1440,19 @@ static void cb_azure_kusto_flush(struct flb_event_chunk *event_chunk,
 
         /* If the file is ready for upload */
         if ((upload_file != NULL) && (upload_timeout_check == FLB_TRUE || total_file_size_check == FLB_TRUE)) {
-            flb_sds_destroy(json);
-            json = NULL;
+            if (json) {
+                flb_sds_destroy(json);
+                json = NULL;
+            }
 
             ret = azure_kusto_format(ctx, tag_name, tag_name_len, event_chunk->data,
                                      event_chunk->size, (void **)&json, &json_size,
                                      config);
             if (ret != 0) {
                 flb_plg_error(ctx->ins, "cannot reformat data into json");
+                if (upload_file) {
+                    azure_kusto_store_file_unlock(upload_file);
+                }
                 ret = FLB_RETRY;
                 goto error;
             }
