@@ -7,18 +7,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 
-echo "=== Building fluent-bit with debug symbols and AddressSanitizer ==="
+echo "=== Building fluent-bit with debug symbols ==="
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Build with ASAN and debug symbols
+# Build with Debug symbols (simdutf disabled due to AVX2 compilation issues)
 cmake -DCMAKE_BUILD_TYPE=Debug \
       -DFLB_DEBUG=On \
-      -DFLB_SANITIZE_ADDRESS=On \
-      -DFLB_SANITIZE_UNDEFINED=Off \
+      -DFLB_DEV=On \
+      -DFLB_USE_SIMDUTF=No \
       ..
 
-make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) fluent-bit
+make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 echo ""
 echo "=== Build complete. Starting fluent-bit with test configuration ==="

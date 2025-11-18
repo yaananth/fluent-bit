@@ -1,0 +1,1 @@
+{"timestamp":"2024-11-05T19:58:35Z","event":"test","message":"Small test payload for memory leak validation","level":"info","service":"fluent-bit-test"}
