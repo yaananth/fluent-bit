@@ -807,9 +807,11 @@ static int ingest_to_kusto(void *out_context, flb_sds_t new_data,
     if (!payload) {
         flb_plg_error(ctx->ins, "Could not create payload SDS");
         flb_free(buffer);
+        buffer = NULL;
         return -1;
     }
     flb_free(buffer);
+    buffer = NULL;
 
     /* Compress the JSON payload */
     if (ctx->compression_enabled == FLB_TRUE) {

@@ -154,8 +154,22 @@ static int http_conn_event(void *data)
                 conn->buf_len -= request_len;
             }
             else {
-                memset(conn->buf_data, 0, request_len);
                 conn->buf_len = 0;
+                
+                /* Shrink oversized buffers to prevent memory accumulation from large payloads.
+                 * If buffer grew beyond 2x chunk_size (e.g., from 1MB to 5MB for large JSON),
+                 * reallocate down to chunk_size since we're done processing this request.
+                 * This is critical for keep-alive connections that persist across many requests.
+                 */
+                if (conn->buf_size > ctx->buffer_chunk_size * 2) {
+                    char *tmp = flb_realloc(conn->buf_data, ctx->buffer_chunk_size);
+                    if (tmp) {
+                        conn->buf_data = tmp;
+                        conn->buf_size = ctx->buffer_chunk_size;
+                        flb_plg_debug(ctx->ins, "fd=%i shrunk buffer from %zu to %zu",
+                                     connection->fd, conn->buf_size, ctx->buffer_chunk_size);
+                    }
+                }
             }
 
             /* Reinitialize the parser so the next request is properly

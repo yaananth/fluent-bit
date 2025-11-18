@@ -352,11 +352,20 @@ int process_pack(struct flb_http *ctx, flb_sds_t tag, char *buf, size_t size)
     }
 
     msgpack_unpacked_destroy(&result);
+    
+    /* Fully release log encoder buffers to prevent accumulation.
+     * While reset() is called in the loop, destroy/reinit ensures
+     * internal buffers are completely freed, critical for large payloads.
+     */
+    flb_log_event_encoder_destroy(&ctx->log_encoder);
+    flb_log_event_encoder_init(&ctx->log_encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
 
     return 0;
 
 log_event_error:
     msgpack_unpacked_destroy(&result);
+    flb_log_event_encoder_destroy(&ctx->log_encoder);
+    flb_log_event_encoder_init(&ctx->log_encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
     flb_plg_error(ctx->ins, "Error encoding record : %d", ret);
     return ret;
 }
@@ -1132,11 +1141,18 @@ static int process_pack_ng(struct flb_http *ctx, flb_sds_t tag, char *buf, size_
     }
 
     msgpack_unpacked_destroy(&result);
+    
+    /* Fully release log encoder buffers to prevent accumulation.\n     * While reset() is called in the loop, destroy/reinit ensures\n     * internal buffers are completely freed, critical for large payloads.\n     */
+    flb_log_event_encoder_destroy(&ctx->log_encoder);
+    flb_log_event_encoder_init(&ctx->log_encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
+    
     return 0;
 
 log_event_error:
     flb_plg_error(ctx->ins, "Error encoding record : %d", ret);
     msgpack_unpacked_destroy(&result);
+    flb_log_event_encoder_destroy(&ctx->log_encoder);
+    flb_log_event_encoder_init(&ctx->log_encoder, FLB_LOG_EVENT_FORMAT_DEFAULT);
     return -1;
 }
 
